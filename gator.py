@@ -1,5 +1,7 @@
 from torch.distributions.normal import Normal
 from torch.autograd import Variable
+import torch
+import torch.optim as optim
 
 def reparametrization_trick_gaussian(mu, sigma2, device, n_samples):
     # Expand the mean tensor to match the required shape
@@ -13,16 +15,25 @@ def reparametrization_trick_gaussian(mu, sigma2, device, n_samples):
     return samples
 
 
+def validity_loss(x0,x_new,model):
+    output_x0 = model(x0)
+    output_x_new = model(x_new)
+    # Compute 1 - model(x_new)
+    one_minus_output_x_new = 1 - output_x_new
+    # Compute the difference between model(x0) and 1 - model(x_new)
+    difference = output_x0 - one_minus_output_x_new
+    # Calculate the norm of the difference tensor
+    # You can choose different norms such as L1, L2, etc.
+    # Here, we compute the L2 norm using torch.norm
+    norm_difference = torch.norm(difference, p=2)
+    return norm_difference
 
-def croco(model,delta,x,weights,n_samples,lr,sigma2,robustness_target,robustness_epsilon,n_iter,t,m):
+def croco(model,autoencoder,delta,x,weights,n_samples,lr,sigma2,robustness_target,robustness_epsilon,n_iter,t,m):
     device = "cpu"
     # Input example as a tensor 
     x0 = torch.from_numpy(x).float().to(device)
-    # Target class
-    pred_class = 0
     # Tensor init perturb
     delta = torch.from_numpy(delta)
-
 
     # Target classes are 1, one hot encoded -> [0,1]
     y_target_class = torch.tensor([0,1]).float().to(device)
@@ -39,18 +50,15 @@ def croco(model,delta,x,weights,n_samples,lr,sigma2,robustness_target,robustness
     optimizer = optim.Adam([Perturb], lr, amsgrad=True)
     # MSE loss for class term 
     loss_fn = torch.nn.MSELoss()
-    # Prediction for the counterfactual 
-    f_x_binary = model(x_cf_new.float())
-    #f_x = f_x_binary[1-pred_class]
-    f_x = f_x_binary[:,1-pred_class]
-    #get samples
-    random_samples = reparametrization_trick_gaussian(x_cf_new, sigma2, device, n_samples=n_samples)
 
+    #get samples
+    random_samples = reparametrization_trick_gaussian(autoencoder.encode(x_cf_new.float()), sigma2, device, n_samples=n_samples)
+    random_samples = autoencoder.decode(random_samples)
     G = random_samples
 
     # Compute robustness constraint term 
     #compute_robutness = (m + torch.mean(G_target- model((G_new).float())[:,1-pred_class])) / (1-t)
-    compute_robutness = (m + torch.mean(G_target- model((G).float())[1-pred_class])) / (1-t)
+    compute_robutness = (m + torch.mean(G_target - model((G).float())[1-pred_class])) / (1-t)
 
     #Lambda = []
     #Dist = []
@@ -63,12 +71,9 @@ def croco(model,delta,x,weights,n_samples,lr,sigma2,robustness_target,robustness
         for it in range(n_iter) :
             optimizer.zero_grad()
             x_cf_new = x0+Perturb
-            # Prediction for the counterfactual 
-            f_x_binary = model(x_cf_new.float())
-            #f_x = f_x_binary[1-pred_class]
-            f_x = f_x_binary[:,1-pred_class]
             # Take random samples 
-            random_samples = reparametrization_trick_gaussian(x_cf_new, torch.tensor(sigma2), device, n_samples=n_samples)
+            random_samples = reparametrization_trick_gaussian(autoencoder.encode(x_cf_new.float()), sigma2, device, n_samples=n_samples)
+            random_samples = autoencoder.decode(random_samples)
             #invalidation_rate = compute_invalidation_rate(model, random_samples)
             # New perturbated group translated 
             G = random_samples
@@ -78,7 +83,8 @@ def croco(model,delta,x,weights,n_samples,lr,sigma2,robustness_target,robustness
             # Diff between robustness and targer robustness 
             robustness_invalidation = compute_robutness - robustness_target            
             # Overall loss function 
-            loss = rob_w*robustness_invalidation**2 + val_w*loss_fn(f_x_binary,y_target_class) + prox_w* torch.norm(Perturb,p=1)
+            #loss = rob_w*robustness_invalidation**2 + val_w*loss_fn(f_x_binary,y_target_class) + prox_w* torch.norm(Perturb,p=1)
+            loss = rob_w*robustness_invalidation**2 + val_w*validity_loss(x0,x_cf_new.float(),model) + prox_w* torch.norm(Perturb,p=1)
             loss.backward()
             optimizer.step()
             
@@ -103,5 +109,6 @@ def croco(model,delta,x,weights,n_samples,lr,sigma2,robustness_target,robustness
     final_perturb = Perturb.clone()
     x_new =(x0 + final_perturb).float().detach()
     return x_new,hist
+            
             
  
