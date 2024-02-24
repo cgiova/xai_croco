@@ -2,6 +2,203 @@ from torch.distributions.normal import Normal
 from torch.autograd import Variable
 import torch
 import torch.optim as optim
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import transforms
+
+def croco(model,
+          autoencoder,
+          input_data,
+          weights,
+          sigma2=0.3,
+          max_iter=1000,
+          learning_rate=0.01,
+          device="cpu",
+          n_samples=500):
+    
+    # check if weights are correct
+    if weights is None:
+        weights = {"robustness":1, "validity":1, "proximity":1}
+    else:
+        required_keys = ["robustness", "validity", "proximity"]
+        assert all(key in weights for key in required_keys), "Dictionary is missing required keys"
+    
+    if autoencoder is None:
+        perturbed_data, hist = alligator(
+            model,
+            input_data,
+            weights,
+            sigma2,
+            max_iter,
+            n_samples,
+            learning_rate,
+            device
+        )
+    else:
+        perturbed_data, hist = alligator_latent(
+            model,
+            autoencoder,
+            input_data,
+            weights,
+            sigma2,
+            max_iter,
+            n_samples,
+            learning_rate,
+            device
+        )
+    
+    return perturbed_data, hist
+
+
+def recourse_invalidation(model,input_data, perturbed_data, sigma2, device, n_samples):
+    """
+    Computes recourse invalidation rate around perturbed_data.
+    
+    """
+    random_samples = reparametrization_trick_gaussian(perturbed_data, sigma2, device, n_samples)
+    # Reapply normalization (added step)
+    random_samples_normalized = transforms.Normalize((0.1307,), (0.3081,))(random_samples)
+    validity = model(input_data)[:,0] - (1 - model(random_samples_normalized)[:,0])
+    return torch.mean(torch.square(validity))
+
+def recourse_invalidation_latent(model, autoencoder,input_data, perturbed_latent, sigma2, device, n_samples):
+    """
+    Computes recourse invalidation rate around perturbed_data in latent space.
+    
+    """
+    random_samples = reparametrization_trick_gaussian(perturbed_latent, sigma2, device, n_samples)    
+    #decode the latent representation
+    random_samples = autoencoder.decode(random_samples)
+    # Reapply normalization (added step)
+    random_samples_normalized = transforms.Normalize((0.1307,), (0.3081,))(random_samples)
+    validity = model(input_data)[:,0] - (1 - model(random_samples_normalized)[:,0])
+    return torch.mean(torch.square(validity))
+
+
+def alligator(model,
+              input_data,
+              weights,
+              sigma2,
+              max_iter,
+              n_samples=500,
+              learning_rate=0.01,
+              device="cpu"):
+    """
+    Finds an adversarial perturbation for a PyTorch model in the latent space.
+
+    Args:
+        model (nn.Module): The PyTorch model to analyze.
+        autoencoder (nn.Module): The autoencoder used to encode and decode the data.
+        input_data (torch.Tensor): The initial datapoint.
+        max_iterations (int): The maximum number of iterations to search.
+        learning_rate (float, optional): The initial learning rate for Adam. Defaults to 0.001.
+        device (str, optional): The device to use (CPU or GPU). Defaults to "cpu".
+
+    Returns:
+        torch.Tensor: The adversarial perturbation (if found), None otherwise.
+    """
+
+    # Initialize delta (perturbation in the latent space) and move it to the same device as the model
+    delta = torch.zeros_like(input_data).to(device).requires_grad_()
+    optimizer = optim.Adam([delta], lr=learning_rate)
+    hist = {"loss":[]}
+
+    # Perform optimization
+    for epoch in range(max_iter):  # Adjust the number of epochs as needed
+        optimizer.zero_grad()
+        # Perturb the latent representation
+        perturbed_data = input_data + delta
+        # Reapply normalization (added step)
+        perturbed_data_normalized = transforms.Normalize((0.1307,), (0.3081,))(perturbed_data)
+
+        # Calculate loss based on the output label of your model
+        robustness = weights["robustness"] * recourse_invalidation(model,input_data, perturbed_data, sigma2, device, n_samples)
+        validity = weights["validity"] * torch.norm(model(input_data)[:,0]-(1-model(perturbed_data_normalized)[:,0]),p=2)
+        proximity = weights["proximity"] * torch.norm(delta,p=1)
+        #calculate proximity        
+        loss =  robustness + validity + proximity
+
+        # Backpropagation
+        loss.backward()
+        optimizer.step()
+
+        # Optional: print loss for monitoring
+        hist["loss"].append(loss.item)
+
+    return perturbed_data_normalized, hist
+
+
+def alligator_latent(model,
+                     autoencoder,
+                     input_data,
+                     weights,
+                     sigma2,
+                     max_iter,
+                     n_samples=500,
+                     learning_rate=0.01,
+                     device="cpu"):
+    """
+    Finds an adversarial perturbation for a PyTorch model in the latent space.
+
+    Args:
+        model (nn.Module): The PyTorch model to analyze.
+        autoencoder (nn.Module): The autoencoder used to encode and decode the data.
+        input_data (torch.Tensor): The initial datapoint.
+        max_iterations (int): The maximum number of iterations to search.
+        learning_rate (float, optional): The initial learning rate for Adam. Defaults to 0.001.
+        device (str, optional): The device to use (CPU or GPU). Defaults to "cpu".
+
+    Returns:
+        torch.Tensor: The adversarial perturbation (if found), None otherwise.
+    """
+
+    # Initialize delta (perturbation in the latent space) and move it to the same device as the model
+    latent_size = 4  # Adjust based on your latent space size
+    delta = torch.zeros(1, latent_size, 7, 7).to(device).requires_grad_()
+    optimizer = optim.Adam([delta], lr=learning_rate)
+    hist = {"loss":[]}
+
+    # Perform optimization
+    for epoch in range(max_iter):  # Adjust the number of epochs as needed
+        optimizer.zero_grad()
+        # Get the reconstructed data and the latent representation
+        latent_representation = autoencoder.encode(input_data)
+        # Perturb the latent representation
+        perturbed_latent = latent_representation + delta
+        # Decode the perturbed latent space
+        perturbed_data = autoencoder.decode(perturbed_latent)
+        # Reapply normalization (added step)
+        perturbed_data_normalized = transforms.Normalize((0.1307,), (0.3081,))(perturbed_data)
+
+        # Calculate loss based on the output label of your model
+        robustness = weights["robustness"] * recourse_invalidation_latent(
+            model,
+            autoencoder,
+            input_data,
+            perturbed_latent,
+            sigma2,
+            device,
+            n_samples
+        )
+        validity = weights["validity"] * torch.norm(model(input_data)[:,0]-(1-model(perturbed_data_normalized)[:,0]),p=2)
+        proximity = weights["proximity"] * torch.norm(delta,p=1)
+        #calculate proximity        
+        loss =  robustness + validity + proximity
+
+        # Backpropagation
+        loss.backward()
+        optimizer.step()
+
+        # Optional: print loss for monitoring
+        hist["loss"].append(loss.item)
+
+    # Check the final perturbed data and its label
+    final_perturbed_data = autoencoder.decode(latent_representation + delta)
+    final_output_label = model(final_perturbed_data)
+
+    return final_perturbed_data, hist
+
+
 
 def reparametrization_trick_gaussian(mu, sigma2, device, n_samples):
     # Expand the mean tensor to match the required shape
@@ -13,102 +210,3 @@ def reparametrization_trick_gaussian(mu, sigma2, device, n_samples):
     # Sample from the Normal distribution
     samples = normal_dist.sample()
     return samples
-
-
-def validity_loss(x0,x_new,model):
-    output_x0 = model(x0)
-    output_x_new = model(x_new)
-    # Compute 1 - model(x_new)
-    one_minus_output_x_new = 1 - output_x_new
-    # Compute the difference between model(x0) and 1 - model(x_new)
-    difference = output_x0 - one_minus_output_x_new
-    # Calculate the norm of the difference tensor
-    # You can choose different norms such as L1, L2, etc.
-    # Here, we compute the L2 norm using torch.norm
-    norm_difference = torch.norm(difference, p=2)
-    return norm_difference
-
-def croco(model,autoencoder,delta,x,weights,n_samples,lr,sigma2,robustness_target,robustness_epsilon,n_iter,t,m):
-    device = "cpu"
-    # Input example as a tensor 
-    x0 = torch.from_numpy(x).float().to(device)
-    # Tensor init perturb
-    delta = torch.from_numpy(delta)
-
-    # Target classes are 1, one hot encoded -> [0,1]
-    y_target_class = torch.tensor([0,1]).float().to(device)
-    y_target = y_target_class[1]
-    G_target = torch.tensor(y_target).float().to(device)
-    # Init weights value
-    rob_w = torch.tensor(weights[0]).float()
-    val_w = torch.tensor(weights[1]).float()
-    prox_w = torch.tensor(weights[2]).float()
-    # Init perturb 
-    Perturb = Variable(torch.clone(delta.to(device)), requires_grad=True)
-    x_cf_new = (x0+Perturb).to(device)
-    # Set optimizer 
-    optimizer = optim.Adam([Perturb], lr, amsgrad=True)
-    # MSE loss for class term 
-    loss_fn = torch.nn.MSELoss()
-
-    #get samples
-    random_samples = reparametrization_trick_gaussian(autoencoder.encode(x_cf_new.float()), sigma2, device, n_samples=n_samples)
-    random_samples = autoencoder.decode(random_samples)
-    G = random_samples
-
-    # Compute robustness constraint term 
-    #compute_robutness = (m + torch.mean(G_target- model((G_new).float())[:,1-pred_class])) / (1-t)
-    compute_robutness = (m + torch.mean(G_target - model((G).float())[1-pred_class])) / (1-t)
-
-    #Lambda = []
-    #Dist = []
-    #Rob = []
-    hist={}
-    hist['robustness'],hist["validity"],hist["proximity"],hist["loss"] = [],[],[],[]
-    #hist["perturbations"]
-    while (f_x <=t) and (compute_robutness > robustness_target + robustness_epsilon) : 
-        it=0
-        for it in range(n_iter) :
-            optimizer.zero_grad()
-            x_cf_new = x0+Perturb
-            # Take random samples 
-            random_samples = reparametrization_trick_gaussian(autoencoder.encode(x_cf_new.float()), sigma2, device, n_samples=n_samples)
-            random_samples = autoencoder.decode(random_samples)
-            #invalidation_rate = compute_invalidation_rate(model, random_samples)
-            # New perturbated group translated 
-            G = random_samples
-            # Compute (m + theta) / (1-t)
-            mean_proba =  torch.mean(model((G).float())[:,pred_class])
-            compute_robutness = (m + mean_proba) /(1-t)
-            # Diff between robustness and targer robustness 
-            robustness_invalidation = compute_robutness - robustness_target            
-            # Overall loss function 
-            #loss = rob_w*robustness_invalidation**2 + val_w*loss_fn(f_x_binary,y_target_class) + prox_w* torch.norm(Perturb,p=1)
-            loss = rob_w*robustness_invalidation**2 + val_w*validity_loss(x0,x_cf_new.float(),model) + prox_w* torch.norm(Perturb,p=1)
-            loss.backward()
-            optimizer.step()
-            
-            hist["robustness"].append((robustness_invalidation**2).item())
-            hist["validity"].append(loss_fn(f_x_binary,y_target_class).item())
-            hist["proximity"].append( torch.norm(Perturb,p=1).item())
-            hist["loss"].append(loss.item())
-
-            it += 1
-        if (f_x > t) and ((compute_robutness < robustness_target + robustness_epsilon))  :
-            print("Counterfactual Explanation Found")
-            break   
-        
-        # this behaviour is not in the paper and is concerning
-        #lamb -= 0.25
-
-        # Stop if no solution found for different lambda values 
-        #if lamb <=0 :
-        #    print("No Counterfactual Explanation Found for these lambda values")
-        #    break
-
-    final_perturb = Perturb.clone()
-    x_new =(x0 + final_perturb).float().detach()
-    return x_new,hist
-            
-            
- 

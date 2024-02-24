@@ -10,22 +10,30 @@ from torch.utils.data import DataLoader, Dataset
 
 
 class ConvNet(nn.Module):
+
     def __init__(self):
-        super(ConvNet, self).__init__()
-        self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
-        self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
-        self.conv2_drop = nn.Dropout2d()
-        self.fc1 = nn.Linear(320, 50)
-        self.fc2 = nn.Linear(50, 10)
+        super().__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(1, 10, kernel_size=5),
+            nn.MaxPool2d(2),
+            nn.ReLU(),
+            nn.Conv2d(10, 20, kernel_size=5),
+            nn.Dropout(),
+            nn.MaxPool2d(2),
+            nn.ReLU(),
+        )
+        self.fc_layers = nn.Sequential(
+            nn.Linear(320, 50),
+            nn.ReLU(),
+            nn.Dropout(),
+            nn.Linear(50, 10)
+        )
 
     def forward(self, x):
-        x = F.relu(F.max_pool2d(self.conv1(x), 2))
-        x = F.relu(F.max_pool2d(self.conv2_drop(self.conv2(x)), 2))
-        x = x.view(-1, 320)
-        x = F.relu(self.fc1(x))
-        x = F.dropout(x, training=self.training)
-        x = self.fc2(x)
-        return F.log_softmax(x,dim=1)
+        x = self.conv_layers(x)
+        x = torch.flatten(x, 1)
+        x = self.fc_layers(x)
+        return x
     
 class Extra_layer(nn.Module):
     def __init__(self):
@@ -56,39 +64,39 @@ class Autoencoder(nn.Module):
 
     def forward(self, x):
         ## encode ##
-        # add hidden layers with relu activation function
+        # add hidden layers with leaky relu activation function
         # and maxpooling after
-        x = F.relu(self.conv1(x))
+        x = F.leaky_relu(self.conv1(x))
         x = self.pool(x)
         # add second hidden layer
-        x = F.relu(self.conv2(x))
+        x = F.leaky_relu(self.conv2(x))
         x = self.pool(x)  # compressed representation
         
         ## decode ##
-        # add transpose conv layers, with relu activation function
-        x = F.relu(self.t_conv1(x))
-        # output layer (with sigmoid for scaling from 0 to 1)
-        x = F.sigmoid(self.t_conv2(x))
+        # add transpose conv layers, with leaky relu activation function
+        x = F.leaky_relu(self.t_conv1(x))
+        # output layer
+        x = self.t_conv2(x)
                 
         return x
     
     def encode(self, x):
         ## encode ##
-        # add hidden layers with relu activation function
+        # add hidden layers with leaky relu activation function
         # and maxpooling after
-        x = F.relu(self.conv1(x))
+        x = F.leaky_relu(self.conv1(x))
         x = self.pool(x)
         # add second hidden layer
-        x = F.relu(self.conv2(x))
+        x = F.leaky_relu(self.conv2(x))
         x = self.pool(x)  # compressed representation
         return x
     
     def decode(self, x):
         ## decode ##
-        # add transpose conv layers, with relu activation function
-        x = F.relu(self.t_conv1(x))
-        # output layer (with sigmoid for scaling from 0 to 1)
-        x = torch.sigmoid(self.t_conv2(x))
+        # add transpose conv layers, with leaky relu activation function
+        x = F.leaky_relu(self.t_conv1(x))
+        # output layer
+        x = self.t_conv2(x)
         return x
 
 
@@ -104,48 +112,35 @@ class BinaryMNIST(Dataset):
         return img, target
 
     def __len__(self):
-        return len(self.mnist)    
+        return len(self.mnist)
     
     
-def train(epoch, train_loader, network, optimizer):
-    network.train()
-    for batch_idx, (data, target) in tqdm(enumerate(train_loader), total=len(train_loader)):
-        optimizer.zero_grad()
-        output = network(data)
-        loss = F.nll_loss(output, target)
-        loss.backward()
-        optimizer.step()
-            
-def test(test_loader, network):
-    network.eval()
-    test_loss = 0
-    correct = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            output = network(data)
-            test_loss += F.nll_loss(output, target, reduction='sum').item()
-            pred = output.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target.view_as(pred)).sum().item()
-    print('Test set: Avg. loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)'.format(
-        test_loss / len(test_loader.dataset), correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
+class ClassificationMNIST(Dataset):
+    def __init__(self, root, train=True, transform=None, target_digit=1, class_0_digit=0):
+        self.mnist = MNIST(root, train=train, transform=transform, download=True)
+        self.target_digit = target_digit
+        self.class_0_digit = class_0_digit
+
+        # Find indices of samples corresponding to the target digits
+        self.indices = []
+        for i, (_, target) in enumerate(self.mnist):
+            if target == self.target_digit or target == self.class_0_digit:
+                self.indices.append(i)
+
+    def __getitem__(self, index):
+        # Get the index of the sample within the selected indices
+        index = self.indices[index]
+        img, target = self.mnist[index]
+        # Modify the label to be 1 if it's the target digit, otherwise 0
+        if target == self.target_digit:
+            label = 1
+        elif target == self.class_0_digit:
+            label = 0
+        else:
+            # This should never happen, but you can handle it if needed
+            raise ValueError(f"Unexpected target value: {target}")
+        return img, label
+
+    def __len__(self):
+        return len(self.indices)
     
-    
-def train_encoder(epoch, train_loader, network, optimizer):
-    network.train()
-    for batch_idx, (data, _) in tqdm(enumerate(train_loader), total=len(train_loader)):
-        optimizer.zero_grad()
-        output = network(data)
-        loss = F.mse_loss(output, data)  # Use MSE loss for reconstruction
-        loss.backward()
-        optimizer.step()
-            
-def test_encoder(test_loader, network):
-    network.eval()
-    test_loss = 0
-    with torch.no_grad():
-        for data, _ in test_loader:
-            output = network(data)
-            test_loss += F.mse_loss(output, data, reduction='sum').item()  # Use MSE loss for reconstruction
-    test_loss /= len(test_loader.dataset)
-    print('Test set: Avg. loss: {:.4f}'.format(test_loss))
