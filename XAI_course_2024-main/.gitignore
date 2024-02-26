@@ -1,0 +1,13 @@
+Tabular/.ipynb_checkpoints
+Images/.ipynb_checkpoints
+*.ipynb_checkpoints
+*.DS_Store
+*.pyc
+
+Images/datasets/MNIST
+
+Imagenet_original.ipynb
+MNIST_original.ipynb
+CIFAR_original.ipynb
+Abele_custom_model.ipynb
+Images/datasets/cifar_x.p
